@@ -557,3 +557,103 @@ def test_failed_upload_does_not_replace_previous_success(
     assert stored.text == first_text
     assert tracked_spools
     assert_spools_closed(tracked_spools)
+
+
+def test_authenticated_user_can_retrieve_own_upload_preview(uploads_client) -> None:
+    client, _ = uploads_client
+    _, headers = register_and_login(client, "preview-owner@example.com")
+
+    uploaded = client.post(
+        "/uploads",
+        headers=headers,
+        files={"file": ("notes.txt", STUDY_TEXT.encode("utf-8"), "text/plain")},
+    )
+    assert uploaded.status_code == 200
+    upload_id = uploaded.json()["upload_id"]
+
+    response = client.get(f"/uploads/{upload_id}", headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert set(data) == {
+        "upload_id",
+        "source_name",
+        "file_type",
+        "char_count",
+        "preview",
+    }
+    assert data == uploaded.json()
+    assert data["upload_id"] == upload_id
+    assert data["source_name"] == "notes.txt"
+    assert data["file_type"] == "txt"
+    assert data["char_count"] == len(STUDY_TEXT)
+    assert data["preview"] == STUDY_TEXT
+
+
+def test_upload_preview_requires_authentication(uploads_client) -> None:
+    client, _ = uploads_client
+    _, headers = register_and_login(client, "preview-auth@example.com")
+
+    uploaded = client.post(
+        "/uploads",
+        headers=headers,
+        files={"file": ("notes.txt", STUDY_TEXT.encode("utf-8"), "text/plain")},
+    )
+    assert uploaded.status_code == 200
+
+    response = client.get(f"/uploads/{uploaded.json()['upload_id']}")
+
+    assert response.status_code == 401
+
+
+def test_unknown_upload_id_returns_404(uploads_client) -> None:
+    client, _ = uploads_client
+    _, headers = register_and_login(client, "unknown-preview@example.com")
+
+    response = client.get("/uploads/unknown-upload-id", headers=headers)
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Upload not found."}
+
+
+def test_wrong_owner_gets_same_404_as_unknown_upload(uploads_client) -> None:
+    client, _ = uploads_client
+    _, owner_headers = register_and_login(client, "preview-owner-a@example.com")
+    _, other_headers = register_and_login(client, "preview-owner-b@example.com")
+
+    uploaded = client.post(
+        "/uploads",
+        headers=owner_headers,
+        files={"file": ("notes.txt", STUDY_TEXT.encode("utf-8"), "text/plain")},
+    )
+    assert uploaded.status_code == 200
+    upload_id = uploaded.json()["upload_id"]
+
+    unknown = client.get("/uploads/unknown-upload-id", headers=other_headers)
+    wrong_owner = client.get(f"/uploads/{upload_id}", headers=other_headers)
+
+    assert unknown.status_code == 404
+    assert wrong_owner.status_code == 404
+    assert wrong_owner.json() == unknown.json()
+    assert wrong_owner.json() == {"detail": "Upload not found."}
+
+
+def test_retrieved_preview_is_limited_to_800_characters(uploads_client) -> None:
+    client, _ = uploads_client
+    _, headers = register_and_login(client, "long-preview@example.com")
+    text = "Study text." * 100
+
+    uploaded = client.post(
+        "/uploads",
+        headers=headers,
+        files={"file": ("long.txt", text.encode("utf-8"), "text/plain")},
+    )
+    assert uploaded.status_code == 200
+
+    response = client.get(f"/uploads/{uploaded.json()['upload_id']}", headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["preview"] == text[:800]
+    assert len(data["preview"]) == 800
+    assert data["char_count"] == len(text)
