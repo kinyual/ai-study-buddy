@@ -3,11 +3,13 @@
 from fastapi import FastAPI
 
 from .api.auth import router as auth_router
+from .api.quizzes import router as quizzes_router
 from .api.uploads import router as uploads_router
 
 app = FastAPI(title="AI Study Buddy", version="0.1.0")
 app.include_router(auth_router)
 app.include_router(uploads_router)
+app.include_router(quizzes_router)
 
 
 @app.get("/health")
