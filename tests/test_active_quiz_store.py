@@ -107,11 +107,13 @@ def test_save_quiz_retains_metadata_and_full_questions() -> None:
         difficulty="Medium",
         question_count=5,
         questions=questions,
+        source_name="notes.txt",
     )
 
     assert quiz.owner_id == 7
     assert quiz.difficulty == "Medium"
     assert quiz.question_count == 5
+    assert quiz.source_name == "notes.txt"
     assert quiz.submitted is False
     assert isinstance(quiz.questions, tuple)
     assert [item.model_dump() for item in quiz.questions] == [

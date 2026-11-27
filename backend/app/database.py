@@ -1,10 +1,11 @@
 """SQLAlchemy database setup for the backend."""
 
+import sqlite3
 from collections.abc import Generator
 from pathlib import Path
 
 from sqlalchemy import create_engine, event
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import get_settings
@@ -12,6 +13,19 @@ from .config import get_settings
 settings = get_settings()
 parsed_url = make_url(settings.database_url)
 is_sqlite = parsed_url.get_backend_name() == "sqlite"
+
+
+@event.listens_for(Engine, "connect")
+def _enable_sqlite_foreign_keys(
+    dbapi_connection: object,
+    _connection_record: object,
+) -> None:
+    """Enforce foreign keys on every SQLite connection, including test engines."""
+    if isinstance(dbapi_connection, sqlite3.Connection):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
 
 connect_args = {"check_same_thread": False} if is_sqlite else {}
 engine = create_engine(settings.database_url, connect_args=connect_args)

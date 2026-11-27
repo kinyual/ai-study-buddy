@@ -30,6 +30,7 @@ class ActiveQuiz:
     difficulty: Difficulty
     question_count: QuestionCount
     questions: tuple[GeneratedQuizQuestion, ...]
+    source_name: str | None = None
     submitted: bool = False
 
 
@@ -69,6 +70,7 @@ def save_quiz(
     difficulty: Difficulty,
     question_count: QuestionCount,
     questions: Iterable[GeneratedQuizQuestion],
+    source_name: str | None = None,
 ) -> ActiveQuiz:
     """Store one generated quiz and return a detached copy of it."""
     quiz = ActiveQuiz(
@@ -77,6 +79,7 @@ def save_quiz(
         difficulty=difficulty,
         question_count=question_count,
         questions=_copy_questions(questions),
+        source_name=source_name,
     )
 
     with _lock:

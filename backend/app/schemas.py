@@ -1,5 +1,6 @@
 """Pydantic schemas for API request and response bodies."""
 
+from datetime import datetime
 from typing import Literal, Optional
 
 from pydantic import (
@@ -64,6 +65,7 @@ class UserPublic(BaseModel):
 Difficulty = Literal["Easy", "Medium", "Hard"]
 QuestionCount = Literal[5, 10, 15]
 OptionKey = Literal["A", "B", "C", "D"]
+QuizMode = Literal["uploaded", "topic"]
 
 
 class _NormalizedTextModel(BaseModel):
@@ -204,6 +206,37 @@ class QuizResultResponse(_NormalizedTextModel):
     @model_validator(mode="after")
     def validate_score_range(self) -> "QuizResultResponse":
         """Keep the score inside the valid range for this quiz."""
+        if self.score > self.total_questions:
+            raise ValueError("Score must be between 0 and total_questions.")
+        return self
+
+
+class QuizResultSummary(BaseModel):
+    """A brief entry in one learner's saved result history."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    quiz_id: str = Field(min_length=1)
+    mode: QuizMode
+    topic: Optional[str] = None
+    source_name: Optional[str] = None
+    difficulty: Difficulty
+    question_count: QuestionCount
+    score: int = Field(ge=0)
+    percentage: float = Field(ge=0, le=100)
+    created_at: datetime
+
+
+class SavedQuizResultResponse(QuizResultSummary):
+    """One saved result with the complete per-question review."""
+
+    total_questions: QuestionCount
+    results: list[QuizResultItem]
+
+    @model_validator(mode="after")
+    def validate_saved_score_range(self) -> "SavedQuizResultResponse":
+        """Keep the saved score inside the valid range for this quiz."""
         if self.score > self.total_questions:
             raise ValueError("Score must be between 0 and total_questions.")
         return self

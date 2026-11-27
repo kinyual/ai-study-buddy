@@ -3,23 +3,29 @@
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool, StaticPool
 
+from backend.app.api import quizzes as quizzes_api
 from backend.app.api.deps import get_current_user, get_db
 from backend.app.main import app
-from backend.app.models import Base
+from backend.app.models import Base, QuizResult, QuizResultItem, User
 from backend.app.services import (
     active_quiz_store,
     quiz_generation_service,
     token_service,
     upload_store,
+)
+from backend.app.services.quiz_result_service import (
+    QuizResultAlreadyExistsError,
+    QuizResultPersistenceError,
 )
 from backend.app.services.text_extraction_service import ExtractedMaterial
 from backend.app.services.upload_store import StoredUpload
@@ -290,10 +296,12 @@ def generate_quiz(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
     email: str,
+    *,
+    source_name: str = "notes.txt",
 ) -> tuple[int, dict[str, str], str]:
     """Create one user and generate a quiz for submission tests."""
     owner_id, headers = register_and_login(client, email)
-    stored = store_material(owner_id)
+    stored = store_material(owner_id, source_name=source_name)
     use_fake_gemini(monkeypatch)
 
     response = client.post(
@@ -307,6 +315,59 @@ def generate_quiz(
     )
     assert response.status_code == 200
     return owner_id, headers, response.json()["quiz_id"]
+
+
+def generate_quiz_for_owner(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_id: int,
+    headers: dict[str, str],
+    *,
+    source_name: str = "notes.txt",
+) -> str:
+    """Generate another quiz for an already registered owner."""
+    stored = store_material(owner_id, source_name=source_name)
+    use_fake_gemini(monkeypatch)
+
+    response = client.post(
+        "/quizzes/uploaded",
+        headers=headers,
+        json={
+            "upload_id": stored.upload_id,
+            "difficulty": "Easy",
+            "question_count": 5,
+        },
+    )
+
+    assert response.status_code == 200
+    return response.json()["quiz_id"]
+
+
+def save_result_for_owner(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_id: int,
+    headers: dict[str, str],
+    *,
+    source_name: str = "notes.txt",
+    selected: dict[int, str] | None = None,
+) -> str:
+    """Create one completed result for an already registered owner."""
+    quiz_id = generate_quiz_for_owner(
+        client,
+        monkeypatch,
+        owner_id,
+        headers,
+        source_name=source_name,
+    )
+    response = client.post(
+        "/quizzes/submit",
+        headers=headers,
+        json=submission_body(quiz_id, selected),
+    )
+
+    assert response.status_code == 200
+    return quiz_id
 
 
 def correct_selections() -> dict[int, str]:
@@ -338,6 +399,94 @@ def submission_body(
             for position in positions
         ],
     }
+
+
+def saved_result_count(session_factory: sessionmaker, quiz_id: str) -> int:
+    """Count saved result rows for one quiz id."""
+    with session_factory() as db:
+        return int(
+            db.execute(
+                select(func.count())
+                .select_from(QuizResult)
+                .where(QuizResult.quiz_id == quiz_id)
+            ).scalar_one()
+        )
+
+
+def saved_result_id(session_factory: sessionmaker, quiz_id: str) -> int:
+    """Return the database id of one saved result."""
+    with session_factory() as db:
+        return int(
+            db.execute(
+                select(QuizResult.id).where(QuizResult.quiz_id == quiz_id)
+            ).scalar_one()
+        )
+
+
+def saved_item_count(session_factory: sessionmaker, quiz_id: str) -> int:
+    """Count saved review items belonging to one quiz id."""
+    with session_factory() as db:
+        return int(
+            db.execute(
+                select(func.count())
+                .select_from(QuizResultItem)
+                .join(QuizResult, QuizResultItem.result_id == QuizResult.id)
+                .where(QuizResult.quiz_id == quiz_id)
+            ).scalar_one()
+        )
+
+
+def saved_result_snapshot(
+    session_factory: sessionmaker,
+    quiz_id: str,
+) -> tuple[dict[str, object], list[dict[str, object]]] | None:
+    """Return plain data from one saved result without detached ORM objects."""
+    with session_factory() as db:
+        row = db.execute(
+            select(QuizResult).where(QuizResult.quiz_id == quiz_id)
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+
+        items = (
+            db.execute(
+                select(QuizResultItem)
+                .where(QuizResultItem.result_id == row.id)
+                .order_by(QuizResultItem.position)
+            )
+            .scalars()
+            .all()
+        )
+        return (
+            {
+                "id": row.id,
+                "user_id": row.user_id,
+                "quiz_id": row.quiz_id,
+                "mode": row.mode,
+                "topic": row.topic,
+                "source_name": row.source_name,
+                "difficulty": row.difficulty,
+                "question_count": row.question_count,
+                "score": row.score,
+                "percentage": row.percentage,
+            },
+            [
+                {
+                    "position": item.position,
+                    "question_text": item.question_text,
+                    "option_a": item.option_a,
+                    "option_b": item.option_b,
+                    "option_c": item.option_c,
+                    "option_d": item.option_d,
+                    "correct_option": item.correct_option,
+                    "selected_option": item.selected_option,
+                    "is_correct": item.is_correct,
+                    "explanation": item.explanation,
+                    "source_snippet": item.source_snippet,
+                }
+                for item in items
+            ],
+        )
 
 
 def test_authenticated_user_can_generate_quiz_from_own_upload(
@@ -808,7 +957,7 @@ def test_submission_requires_authentication(
     quizzes_client,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client, _ = quizzes_client
+    client, session_factory = quizzes_client
     owner_id, _, quiz_id = generate_quiz(
         client, monkeypatch, "submit-auth@example.com"
     )
@@ -820,6 +969,7 @@ def test_submission_requires_authentication(
 
     assert response.status_code == 401
     assert active_quiz_store.get_owned_quiz(quiz_id, owner_id).submitted is False
+    assert saved_result_count(session_factory, quiz_id) == 0
 
 
 def test_unknown_quiz_returns_not_found(quizzes_client) -> None:
@@ -840,7 +990,7 @@ def test_another_users_quiz_returns_same_not_found_response(
     quizzes_client,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client, _ = quizzes_client
+    client, session_factory = quizzes_client
     owner_id, _, quiz_id = generate_quiz(
         client, monkeypatch, "submit-hidden-owner@example.com"
     )
@@ -862,6 +1012,7 @@ def test_another_users_quiz_returns_same_not_found_response(
     assert wrong_owner.json() == unknown.json()
     assert wrong_owner.json() == {"detail": "Quiz not found."}
     assert active_quiz_store.get_owned_quiz(quiz_id, owner_id).submitted is False
+    assert saved_result_count(session_factory, quiz_id) == 0
 
 
 @pytest.mark.parametrize("case", ["invalid-option", "duplicate-position"])
@@ -954,7 +1105,7 @@ def test_repeated_submission_returns_conflict(
     quizzes_client,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client, _ = quizzes_client
+    client, session_factory = quizzes_client
     _, headers, quiz_id = generate_quiz(
         client, monkeypatch, "submit-repeat@example.com"
     )
@@ -966,13 +1117,15 @@ def test_repeated_submission_returns_conflict(
     assert first.status_code == 200
     assert second.status_code == 409
     assert second.json() == {"detail": "Quiz has already been submitted."}
+    assert saved_result_count(session_factory, quiz_id) == 1
+    assert saved_item_count(session_factory, quiz_id) == 5
 
 
 def test_another_user_cannot_submit_owned_quiz(
     quizzes_client,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client, _ = quizzes_client
+    client, session_factory = quizzes_client
     owner_id, owner_headers, quiz_id = generate_quiz(
         client, monkeypatch, "submit-owner-only@example.com"
     )
@@ -986,6 +1139,7 @@ def test_another_user_cannot_submit_owned_quiz(
     assert denied.status_code == 404
     assert denied.json() == {"detail": "Quiz not found."}
     assert active_quiz_store.get_owned_quiz(quiz_id, owner_id).submitted is False
+    assert saved_result_count(session_factory, quiz_id) == 0
 
     allowed = client.post(
         "/quizzes/submit",
@@ -993,11 +1147,13 @@ def test_another_user_cannot_submit_owned_quiz(
         json=submission_body(quiz_id),
     )
     assert allowed.status_code == 200
+    assert saved_result_count(session_factory, quiz_id) == 1
 
 
 def test_two_simultaneous_submissions_cannot_both_succeed(
     quizzes_client,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     client, _ = quizzes_client
     owner_id, _, quiz_id = generate_quiz(
@@ -1006,10 +1162,44 @@ def test_two_simultaneous_submissions_cannot_both_succeed(
     barrier = threading.Barrier(2)
     body = submission_body(quiz_id)
 
-    # Two threads sharing this fixture's single SQLite connection can produce
-    # spurious 401s during auth, so isolate the concurrency check from the DB.
-    had_previous_override = get_current_user in app.dependency_overrides
-    previous_override = app.dependency_overrides.get(get_current_user)
+    # The fixture's in-memory database uses one shared SQLite connection. Use a
+    # temporary file with separate connections so the two requests exercise the
+    # database uniqueness rule instead of fighting over one connection.
+    database_path = tmp_path / "concurrent_results.db"
+    concurrent_engine = create_engine(
+        f"sqlite:///{database_path}",
+        connect_args={"check_same_thread": False, "timeout": 10},
+        poolclass=NullPool,
+    )
+    Base.metadata.create_all(bind=concurrent_engine)
+    concurrent_factory = sessionmaker(
+        bind=concurrent_engine,
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+    with concurrent_factory() as db:
+        db.add(
+            User(
+                id=owner_id,
+                email="concurrent-results@example.com",
+                password_hash="test-only-hash",
+            )
+        )
+        db.commit()
+
+    def override_concurrent_db() -> Iterator[Session]:
+        db = concurrent_factory()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    had_previous_db_override = get_db in app.dependency_overrides
+    previous_db_override = app.dependency_overrides.get(get_db)
+    had_previous_user_override = get_current_user in app.dependency_overrides
+    previous_user_override = app.dependency_overrides.get(get_current_user)
+    app.dependency_overrides[get_db] = override_concurrent_db
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=owner_id)
     try:
         def submit(_: int) -> int:
@@ -1019,10 +1209,433 @@ def test_two_simultaneous_submissions_cannot_both_succeed(
         with ThreadPoolExecutor(max_workers=2) as pool:
             statuses = list(pool.map(submit, range(2)))
     finally:
-        if had_previous_override:
-            app.dependency_overrides[get_current_user] = previous_override
+        if had_previous_user_override:
+            app.dependency_overrides[get_current_user] = previous_user_override
         else:
             app.dependency_overrides.pop(get_current_user, None)
+        if had_previous_db_override:
+            app.dependency_overrides[get_db] = previous_db_override
+        else:
+            app.dependency_overrides.pop(get_db, None)
+        concurrent_engine.dispose()
 
     assert sorted(statuses) == [200, 409]
     assert active_quiz_store.get_owned_quiz(quiz_id, owner_id).submitted is True
+    assert saved_result_count(concurrent_factory, quiz_id) == 1
+    assert saved_item_count(concurrent_factory, quiz_id) == 5
+
+
+def test_successful_submission_persists_one_complete_result(
+    quizzes_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_factory = quizzes_client
+    owner_id, headers, quiz_id = generate_quiz(
+        client,
+        monkeypatch,
+        "submit-persist@example.com",
+        source_name="chapter-1.pdf",
+    )
+    selected = correct_selections()
+    selected[2] = "A"
+    selected[4] = "A"
+
+    response = client.post(
+        "/quizzes/submit",
+        headers=headers,
+        json=submission_body(quiz_id, selected),
+    )
+
+    assert response.status_code == 200
+    assert saved_result_count(session_factory, quiz_id) == 1
+    assert saved_item_count(session_factory, quiz_id) == 5
+
+    snapshot = saved_result_snapshot(session_factory, quiz_id)
+    assert snapshot is not None
+    row, items = snapshot
+    assert row["user_id"] == owner_id
+    assert row["quiz_id"] == quiz_id
+    assert row["mode"] == "uploaded"
+    assert row["topic"] is None
+    assert row["source_name"] == "chapter-1.pdf"
+    assert row["difficulty"] == "Easy"
+    assert row["question_count"] == 5
+    assert row["score"] == 3
+    assert row["percentage"] == 60.0
+    assert [item["position"] for item in items] == [1, 2, 3, 4, 5]
+
+    for position, (item, expected) in enumerate(
+        zip(items, QUESTION_FIXTURES),
+        start=1,
+    ):
+        assert item["question_text"] == expected["question_text"]
+        assert item["option_a"] == expected["option_a"]
+        assert item["option_b"] == expected["option_b"]
+        assert item["option_c"] == expected["option_c"]
+        assert item["option_d"] == expected["option_d"]
+        assert item["correct_option"] == expected["correct_option"]
+        assert item["selected_option"] == selected[position]
+        assert item["is_correct"] is (
+            selected[position] == expected["correct_option"]
+        )
+        assert item["explanation"] == expected["explanation"]
+        assert item["source_snippet"] == expected["source_snippet"]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["invalid-option", "missing-position"],
+    ids=["invalid-option", "missing-position"],
+)
+def test_invalid_submissions_create_no_saved_results(
+    quizzes_client,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    client, session_factory = quizzes_client
+    owner_id, headers, quiz_id = generate_quiz(
+        client, monkeypatch, "submit-no-save@example.com"
+    )
+
+    if case == "invalid-option":
+        selected = correct_selections()
+        selected[1] = "E"
+        body = submission_body(quiz_id, selected)
+    else:
+        body = submission_body(quiz_id, positions=[1, 2, 3, 4])
+
+    response = client.post("/quizzes/submit", headers=headers, json=body)
+
+    assert response.status_code == 422
+    assert saved_result_count(session_factory, quiz_id) == 0
+    assert saved_item_count(session_factory, quiz_id) == 0
+    assert active_quiz_store.get_owned_quiz(quiz_id, owner_id).submitted is False
+
+
+def test_duplicate_result_error_returns_existing_conflict(
+    quizzes_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_factory = quizzes_client
+    owner_id, headers, quiz_id = generate_quiz(
+        client, monkeypatch, "submit-duplicate-result@example.com"
+    )
+
+    def raise_duplicate(*_args: object, **_kwargs: object) -> None:
+        raise QuizResultAlreadyExistsError("duplicate detail must not be exposed")
+
+    monkeypatch.setattr(quizzes_api, "save_quiz_result", raise_duplicate)
+
+    response = client.post(
+        "/quizzes/submit",
+        headers=headers,
+        json=submission_body(quiz_id),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Quiz has already been submitted."}
+    assert "duplicate detail must not be exposed" not in response.text
+    assert saved_result_count(session_factory, quiz_id) == 0
+    assert active_quiz_store.get_owned_quiz(quiz_id, owner_id).submitted is False
+
+
+def test_persistence_failure_returns_503_and_allows_retry(
+    quizzes_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_factory = quizzes_client
+    owner_id, headers, quiz_id = generate_quiz(
+        client, monkeypatch, "submit-db-failure@example.com"
+    )
+    body = submission_body(quiz_id)
+    real_save = quizzes_api.save_quiz_result
+    should_fail = {"value": True}
+
+    def fail_once(*args: object, **kwargs: object) -> None:
+        if should_fail["value"]:
+            raise QuizResultPersistenceError(
+                "internal database detail must not be exposed"
+            )
+        real_save(*args, **kwargs)
+
+    monkeypatch.setattr(quizzes_api, "save_quiz_result", fail_once)
+
+    failed = client.post("/quizzes/submit", headers=headers, json=body)
+
+    assert failed.status_code == 503
+    assert failed.json() == {
+        "detail": "Quiz result could not be saved. Please try again."
+    }
+    assert "internal database detail must not be exposed" not in failed.text
+    assert saved_result_count(session_factory, quiz_id) == 0
+    assert saved_item_count(session_factory, quiz_id) == 0
+    assert active_quiz_store.get_owned_quiz(quiz_id, owner_id).submitted is False
+
+    should_fail["value"] = False
+    retried = client.post("/quizzes/submit", headers=headers, json=body)
+
+    assert retried.status_code == 200
+    assert saved_result_count(session_factory, quiz_id) == 1
+    assert active_quiz_store.get_owned_quiz(quiz_id, owner_id).submitted is True
+
+
+def test_empty_history_returns_empty_list(quizzes_client) -> None:
+    client, _ = quizzes_client
+    _, headers = register_and_login(client, "history-empty@example.com")
+
+    response = client.get("/quizzes/results", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_history_lists_completed_results_newest_first(
+    quizzes_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = quizzes_client
+    owner_id, headers = register_and_login(client, "history-order@example.com")
+    quiz_ids = [
+        save_result_for_owner(
+            client,
+            monkeypatch,
+            owner_id,
+            headers,
+            source_name=source_name,
+        )
+        for source_name in ("first.txt", "second.txt", "third.txt")
+    ]
+
+    response = client.get("/quizzes/results", headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) == 3
+    assert [row["quiz_id"] for row in data] == list(reversed(quiz_ids))
+
+
+def test_history_includes_only_the_authenticated_users_results(
+    quizzes_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = quizzes_client
+    owner_id, owner_headers = register_and_login(client, "history-owner@example.com")
+    other_id, other_headers = register_and_login(client, "history-other@example.com")
+    owner_quiz_id = save_result_for_owner(
+        client,
+        monkeypatch,
+        owner_id,
+        owner_headers,
+        source_name="owner-notes.txt",
+    )
+    other_quiz_id = save_result_for_owner(
+        client,
+        monkeypatch,
+        other_id,
+        other_headers,
+        source_name="other-notes.txt",
+    )
+
+    owner_history = client.get("/quizzes/results", headers=owner_headers)
+    other_history = client.get("/quizzes/results", headers=other_headers)
+
+    assert owner_history.status_code == 200
+    assert other_history.status_code == 200
+    assert [row["quiz_id"] for row in owner_history.json()] == [owner_quiz_id]
+    assert [row["quiz_id"] for row in other_history.json()] == [other_quiz_id]
+
+
+def test_history_summaries_hide_question_review_details(
+    quizzes_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = quizzes_client
+    owner_id, headers = register_and_login(client, "history-summary@example.com")
+    save_result_for_owner(
+        client,
+        monkeypatch,
+        owner_id,
+        headers,
+        source_name="summary-notes.txt",
+    )
+
+    response = client.get("/quizzes/results", headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) == 1
+    assert set(data[0]) == {
+        "id",
+        "quiz_id",
+        "mode",
+        "topic",
+        "source_name",
+        "difficulty",
+        "question_count",
+        "score",
+        "percentage",
+        "created_at",
+    }
+    for forbidden in (
+        "results",
+        "correct_option",
+        "selected_option",
+        "explanation",
+        "source_snippet",
+    ):
+        assert forbidden not in response.text
+
+
+def test_individual_result_detail_returns_complete_saved_review(
+    quizzes_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_factory = quizzes_client
+    owner_id, headers = register_and_login(client, "history-detail@example.com")
+    selected = correct_selections()
+    selected[2] = "A"
+    selected[4] = "A"
+    quiz_id = save_result_for_owner(
+        client,
+        monkeypatch,
+        owner_id,
+        headers,
+        source_name="detail-review.pdf",
+        selected=selected,
+    )
+    result_id = saved_result_id(session_factory, quiz_id)
+
+    response = client.get(f"/quizzes/results/{result_id}", headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert set(data) == {
+        "id",
+        "quiz_id",
+        "mode",
+        "topic",
+        "source_name",
+        "difficulty",
+        "question_count",
+        "score",
+        "percentage",
+        "created_at",
+        "total_questions",
+        "results",
+    }
+    assert data["id"] == result_id
+    assert data["quiz_id"] == quiz_id
+    assert data["mode"] == "uploaded"
+    assert data["topic"] is None
+    assert data["source_name"] == "detail-review.pdf"
+    assert data["difficulty"] == "Easy"
+    assert data["question_count"] == 5
+    assert data["total_questions"] == 5
+    assert data["score"] == 3
+    assert data["percentage"] == 60.0
+    assert len(data["results"]) == 5
+
+    for position, (item, expected) in enumerate(
+        zip(data["results"], QUESTION_FIXTURES),
+        start=1,
+    ):
+        assert set(item) == {
+            "position",
+            "question_text",
+            "option_a",
+            "option_b",
+            "option_c",
+            "option_d",
+            "source_snippet",
+            "correct_option",
+            "selected_option",
+            "is_correct",
+            "explanation",
+        }
+        assert item["position"] == position
+        assert item["question_text"] == expected["question_text"]
+        assert item["option_a"] == expected["option_a"]
+        assert item["option_b"] == expected["option_b"]
+        assert item["option_c"] == expected["option_c"]
+        assert item["option_d"] == expected["option_d"]
+        assert item["source_snippet"] == expected["source_snippet"]
+        assert item["correct_option"] == expected["correct_option"]
+        assert item["selected_option"] == selected[position]
+        assert item["is_correct"] is (
+            selected[position] == expected["correct_option"]
+        )
+        assert item["explanation"] == expected["explanation"]
+
+
+def test_individual_result_review_items_are_in_position_order(
+    quizzes_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_factory = quizzes_client
+    owner_id, headers = register_and_login(client, "history-order-items@example.com")
+    quiz_id = save_result_for_owner(client, monkeypatch, owner_id, headers)
+    result_id = saved_result_id(session_factory, quiz_id)
+
+    response = client.get(f"/quizzes/results/{result_id}", headers=headers)
+
+    assert response.status_code == 200
+    assert [item["position"] for item in response.json()["results"]] == [1, 2, 3, 4, 5]
+
+
+def test_result_detail_hides_other_users_result_and_unknown_id(
+    quizzes_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_factory = quizzes_client
+    owner_id, owner_headers = register_and_login(
+        client,
+        "history-hidden-owner@example.com",
+    )
+    _, other_headers = register_and_login(
+        client,
+        "history-hidden-other@example.com",
+    )
+    quiz_id = save_result_for_owner(client, monkeypatch, owner_id, owner_headers)
+    result_id = saved_result_id(session_factory, quiz_id)
+
+    other_users_result = client.get(
+        f"/quizzes/results/{result_id}",
+        headers=other_headers,
+    )
+    unknown_result = client.get(
+        "/quizzes/results/999999",
+        headers=other_headers,
+    )
+
+    assert other_users_result.status_code == 404
+    assert unknown_result.status_code == 404
+    assert other_users_result.json() == unknown_result.json()
+    assert other_users_result.json() == {"detail": "Quiz result not found."}
+
+
+@pytest.mark.parametrize("path", ["/quizzes/results", "/quizzes/results/1"])
+def test_history_endpoints_require_authentication(quizzes_client, path: str) -> None:
+    client, _ = quizzes_client
+
+    response = client.get(path)
+
+    assert response.status_code == 401
+
+
+@pytest.mark.parametrize(
+    ("raw_result_id", "expected_status"),
+    [("not-an-int", 422), ("0", 404)],
+)
+def test_invalid_result_ids_are_handled_safely(
+    quizzes_client,
+    raw_result_id: str,
+    expected_status: int,
+) -> None:
+    client, _ = quizzes_client
+    _, headers = register_and_login(client, "history-invalid-id@example.com")
+
+    response = client.get(f"/quizzes/results/{raw_result_id}", headers=headers)
+
+    assert response.status_code == expected_status
+    if expected_status == 404:
+        assert response.json() == {"detail": "Quiz result not found."}
