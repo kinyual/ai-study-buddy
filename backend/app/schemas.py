@@ -97,6 +97,24 @@ class UploadedQuizRequest(_NormalizedTextModel):
     question_count: QuestionCount
 
 
+UPLOAD_PREVIEW_CHARS = 800
+UploadFileType = Literal["txt", "pdf", "docx"]
+
+
+class UploadResponse(BaseModel):
+    """Response after extracting and temporarily storing an uploaded file."""
+
+    upload_id: str = Field(min_length=1)
+    source_name: str = Field(min_length=1)
+    file_type: UploadFileType
+    char_count: int = Field(ge=0)
+    preview: str = Field(max_length=UPLOAD_PREVIEW_CHARS)
+
+
+class UploadPreviewResponse(UploadResponse):
+    """Metadata and preview returned for one owned uploaded file."""
+
+
 class _QuestionBase(_NormalizedTextModel):
     """Fields shared by every question shown to a learner."""
 
